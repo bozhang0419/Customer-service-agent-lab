@@ -569,6 +569,3 @@ curl -X POST http://localhost:8000/skills/reload
 
 至少需要替换默认密钥、收紧 CORS、限制管理类接口访问、持久化 Redis/ChromaDB 数据、接入监控告警，并避免把真实 `.env` 提交到仓库。
 
-## License
-
-当前仓库未发现独立的 `LICENSE` 文件。正式开源或对外分发前，建议补充明确许可证，例如 MIT、Apache-2.0 或企业内部专有许可证。
