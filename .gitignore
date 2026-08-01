@@ -7,10 +7,10 @@ build/
 .venv/
 venv/
 
-# ç¯å¢ƒå˜é‡ï¼ˆå«æ•æ„Ÿä¿¡æ¯ï¼‰
+# »·¾³±äÁ¿(°üº¬Ãô¸ĞĞÅÏ¢)
 .env
 
-# æ•°æ®ç›®å½•
+# Êı¾İÄ¿Â¼
 data/
 logs/
 
@@ -20,17 +20,20 @@ logs/
 *.swp
 *.swo
 
-# OS
+# ÏµÍ³ÎÄ¼ş
 .DS_Store
 Thumbs.db
 
-# Docker æ„å»ºäº§ç‰©
+# Docker¹¹½¨²úÎï
 build-image*.sh
 
-# ChromaDB æœ¬åœ°æ•°æ®
+# ChromaDB±¾µØÏòÁ¿¿â
 *.sqlite3
 
-# å¤‡ä»½æ–‡ä»¶
+# ±¸·İÎÄ¼ş
 *~
 *.bak
 docker-compose(1).yml
+
+# ±¾µØreasonix»º´æÄ¿Â¼
+.reasonix/
