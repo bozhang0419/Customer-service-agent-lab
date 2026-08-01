@@ -91,25 +91,13 @@ EchoMind 是一个以 FastAPI 为入口的智能客服系统，目标是让企�
 | 组件 | 要求 | 说明 |
 |------|------|------|
 | Python | 3.12 推荐 | Dockerfile 基于 `python:3.12-slim` |
-| Docker | 推荐安装 | 用于一键启动 Redis、ChromaDB、Prometheus、Nginx 与主应用 |
+| Docker | 推荐 | 用于一键启动 Redis、ChromaDB、Prometheus、Nginx 与主应用 |
 | Redis | 7.x | 工作记忆与短期缓存 |
 | ChromaDB | 0.5.23 | 向量知识库、情景记忆与用户画像 |
 | Anthropic 兼容 API | 必需 | 读取 `ANTHROPIC_API_KEY`、`ANTHROPIC_MODEL`、`ANTHROPIC_BASE_URL` |
 
-### 方式一：让 AI 帮你部署
 
-如果你正在 AI 编码工具中打开本项目，可以直接粘贴下面的提示词：
-
-```text
-请帮我部署 EchoMind：
-1. 检查项目根目录是否包含 Dockerfile、docker-compose.yml、requirements.txt 和 .env.example.env。
-2. 如果没有 .env，请从 .env.example.env 复制一份，并提醒我填写 ANTHROPIC_API_KEY。
-3. 使用 docker compose up -d 构建并启动服务。
-4. 调用 http://localhost:8000/health 验证主服务是否可用。
-5. 告诉我 /docs、/monitor、/metrics、/knowledge/stats 的访问方式。
-```
-
-### 方式二：Docker Compose 部署
+### 方式一：Docker Compose 部署
 
 ```bash
 cp .env.example.env .env
@@ -135,7 +123,7 @@ chmod +x docker-deploy.sh
 ./docker-deploy.sh deploy
 ```
 
-### 方式三：本地 Python 运行
+### 方式二：本地 Python 运行
 
 本地运行适合开发调试，但仍需要 Redis 和 ChromaDB 可用。
 
