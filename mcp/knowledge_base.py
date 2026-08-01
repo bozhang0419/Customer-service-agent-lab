@@ -1,34 +1,36 @@
 """
 RAG 知识库 —— 基于 ChromaDB 的真实检索实现。
-
-功能：
-  1. 文档导入：将文本切片后存入 ChromaDB（自动生成 Embedding）
-  2. 语义检索：根据 query 从知识库中检索最相关的文档片段
-  3. 与 MCP 工具框架集成：作为 knowledge_search 工具的真实 handler
-
-ChromaDB 在这里的角色：
-  - memory/ 中用于存储对话记忆（情景记忆 + 用户画像）
-  - 这里用于存储知识库文档（RAG 检索）
-  两者是不同的 collection，互不干扰。
+弃用Chroma内置all-MiniLM，统一调用DeepSeek线上向量接口
 """
 import hashlib
 import logging
 from typing import Any, Dict, List, Optional
 
 import chromadb
-
+from core.embedding_client import EmbeddingClient
 logger = logging.getLogger(__name__)
 
+def _local_embedding(text: str, dims: int = 256) -> list[float]:
+    """
+    本地字符n-gram哈希向量生成
+    与原项目意图识别模块的Embedding兜底逻辑完全一致
+    不调用任何外部接口，纯本地计算
+    """
+    normalized = text.lower().strip()
+    vec = [0.0] * dims
+    tokens = set()
+    # 1/2/3元字符哈希，固定输出256维向量
+    for n in (1, 2, 3):
+        if len(normalized) >= n:
+            tokens.update(normalized[i:i+n] for i in range(len(normalized) - n + 1))
+    for token in tokens:
+        digest = hashlib.md5(token.encode("utf-8")).digest()
+        idx = int.from_bytes(digest[:4], "big") % dims
+        sign = 1.0 if digest[4] % 2 == 0 else -1.0
+        vec[idx] += sign
+    return vec
 
 class KnowledgeBase:
-    """
-    基于 ChromaDB 的 RAG 知识库。
-
-    ChromaDB 内置了 Embedding 模型（all-MiniLM-L6-v2），
-    调用 add() 时自动生成向量，query() 时自动做语义匹配。
-    不需要额外调用 Anthropic Embeddings API。
-    """
-
     COLLECTION_NAME = "knowledge_base"
 
     def __init__(
@@ -37,40 +39,20 @@ class KnowledgeBase:
         chroma_port: int = 8000,
         chroma_path: str = "./data/chroma",
     ):
-        # 优先连接独立 ChromaDB 服务（服务端内置 embedding 模型，客户端无需下载）
         self._use_server = False
-        try:
-            self._client = chromadb.HttpClient(host=chroma_host, port=chroma_port)
-            self._client.heartbeat()
-            self._use_server = True
-            logger.info(f"知识库 ChromaDB 已连接: {chroma_host}:{chroma_port}")
-        except Exception:
-            logger.info(f"知识库 ChromaDB 服务不可用，使用本地模式: {chroma_path}")
-            self._client = chromadb.PersistentClient(
-                path=chroma_path,
-                settings=chromadb.Settings(anonymized_telemetry=False),
-            )
+        self._client = chromadb.PersistentClient(
+            path=chroma_path,
+            settings=chromadb.Settings(anonymized_telemetry=False),
+        )
+        logger.info(f"知识库【本地文件模式】启动，数据存放路径: {chroma_path}")
 
-        # 使用服务端时不传 embedding_function，让服务端处理
-        # 本地模式时也不传，使用 ChromaDB 默认的（会触发模型下载）
         self._collection = self._client.get_or_create_collection(
             name=self.COLLECTION_NAME,
             metadata={"description": "EchoMind RAG 知识库"},
         )
+        self.emb_client = EmbeddingClient()
 
-        # 如果知识库为空，导入默认文档
-        if self._collection.count() == 0:
-            self._load_default_docs()
-
-    # ── 文档管理 ──────────────────────────────────────────────────────────────
-
-    def add_documents(self, documents: List[Dict[str, str]]) -> int:
-        """
-        批量导入文档到知识库。
-
-        documents 格式: [{"title": "...", "content": "..."}, ...]
-        长文档会自动切片（每片 500 字）。
-        """
+    async def add_documents(self, documents: List[Dict[str, str]]) -> int:
         ids, docs, metas = [], [], []
 
         for doc in documents:
@@ -85,20 +67,21 @@ class KnowledgeBase:
                 metas.append({"title": title, "chunk_index": i, "total_chunks": len(chunks)})
 
         if ids:
-            # ChromaDB 会自动生成 Embedding
-            self._collection.add(ids=ids, documents=docs, metadatas=metas)
+            embeddings = [_local_embedding(doc) for doc in docs]
+            self._collection.add(
+                ids=ids,
+                embeddings=embeddings,
+                documents=docs,
+                metadatas=metas
+            )
             logger.info(f"知识库导入 {len(ids)} 个文档片段")
 
         return len(ids)
 
-    def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """
-        语义检索：根据 query 返回最相关的文档片段。
-
-        ChromaDB 内部自动将 query 转为向量，与存储的文档向量做余弦相似度匹配。
-        """
+    async def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        emb = _local_embedding(query)
         results = self._collection.query(
-            query_texts=[query],
+            query_embeddings=[emb],
             n_results=top_k,
         )
 
@@ -112,7 +95,9 @@ class KnowledgeBase:
                 items.append({
                     "title":    meta.get("title", ""),
                     "content":  doc,
-                    "score":    round(1.0 - dist, 4),  # ChromaDB 返回距离，转为相似度
+                    # Chroma 默认 L2 距离 ∈ [0, +∞)，直接 1.0 - dist 不构成相似度且可能为负；
+                    # 用 1/(1+d) 单调映射到 (0, 1]，距离越小分数越高，便于展示与阈值判断。
+                    "score":    round(1.0 / (1.0 + dist), 4),
                     "chunk":    meta.get("chunk_index", 0),
                 })
 
@@ -122,32 +107,17 @@ class KnowledgeBase:
     def doc_count(self) -> int:
         return self._collection.count()
 
-    # ── MCP 工具 handler ─────────────────────────────────────────────────────
-
     async def search_handler(self, params: Dict[str, Any], context: Any) -> List[Dict]:
-        """
-        作为 MCP 工具的 handler 注册。
-
-        MCPToolManager.register(Tool(
-            name="knowledge_search",
-            handler=kb.search_handler,
-            ...
-        ))
-        """
         query = params.get("query", "")
         top_k = params.get("top_k", 5)
-        return self.search(query, top_k=top_k)
-
-    # ── 内部方法 ──────────────────────────────────────────────────────────────
+        return await self.search(query, top_k=top_k)
 
     def _chunk_text(self, text: str, chunk_size: int = 500) -> List[str]:
-        """将长文本按 chunk_size 切片，保留语义完整性（按句号/换行切分）。"""
         if len(text) <= chunk_size:
             return [text] if text.strip() else []
 
         chunks = []
         current = ""
-        # 按句子切分
         sentences = text.replace("\n", "。").split("。")
         for sent in sentences:
             sent = sent.strip()
@@ -165,8 +135,7 @@ class KnowledgeBase:
 
         return chunks
 
-    def _load_default_docs(self) -> None:
-        """导入默认知识库文档（客服场景常见问题）。"""
+    async def _load_default_docs(self) -> None:
         default_docs = [
             {
                 "title": "退款政策",
@@ -238,5 +207,5 @@ class KnowledgeBase:
                 ),
             },
         ]
-        self.add_documents(default_docs)
+        await self.add_documents(default_docs)
         logger.info(f"已导入默认知识库: {len(default_docs)} 篇文档")

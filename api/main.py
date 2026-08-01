@@ -49,6 +49,7 @@ _memory       = None
 _tool_manager = None
 _monitor      = None
 _evaluator    = None
+_skill_manager = None
 
 
 def _anthropic_cfg() -> Dict[str, Any]:
@@ -67,7 +68,7 @@ def _anthropic_cfg() -> Dict[str, Any]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator
+    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager
 
     print(BANNER, flush=True)
 
@@ -78,6 +79,7 @@ async def lifespan(app: FastAPI):
     from mcp.tool_manager import MCPToolManager, Tool
     from memory.conversation_memory import MemoryManager
     from monitor.performance_monitor import PerformanceMonitor
+    from core.skill_loader import SkillManager
 
     cfg = _anthropic_cfg()
     logger.info(f"模型: {cfg['model']}  base_url: {cfg.get('base_url', '(官方)')}")
@@ -89,11 +91,20 @@ async def lifespan(app: FastAPI):
         model=cfg["model"],
     )
 
+    # Skills：启动时从目录加载业务能力说明，并在 Agent 调用 LLM 时动态注入。
+    skills_dir = os.getenv("ECHOMIND_SKILLS_DIR", str(pathlib.Path(_ROOT) / "skills"))
+    _skill_manager = SkillManager(
+        root_dir=skills_dir,
+        max_prompt_chars=int(os.getenv("ECHOMIND_SKILLS_MAX_PROMPT_CHARS", "5000")),
+    )
+    _skill_manager.load()
+
     # Agent 编排器
     _orchestrator = AgentOrchestrator(
         api_key=cfg["api_key"],
         base_url=cfg.get("base_url"),
         model=cfg["model"],
+        skill_manager=_skill_manager,
     )
 
     # 记忆管理器（Redis 工作记忆 + ChromaDB 情景记忆/用户画像）
@@ -216,6 +227,25 @@ async def health():
     return {"status": "ok", "agents": _orchestrator.get_stats()}
 
 
+@app.get("/skills", tags=["Skills"])
+async def skills_summary():
+    """查看当前已加载的 Skills，便于确认热加载结果和排查解析错误。"""
+    if _skill_manager is None:
+        raise HTTPException(503, "Skills 未初始化")
+    return _skill_manager.summary()
+
+
+@app.post("/skills/reload", tags=["Skills"])
+async def reload_skills():
+    """运行时重新扫描 Skill 目录，不需要重启服务。"""
+    if _skill_manager is None:
+        raise HTTPException(503, "Skills 未初始化")
+    _skill_manager.reload()
+    if _orchestrator is not None:
+        _orchestrator.set_skill_manager(_skill_manager)
+    return _skill_manager.summary()
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     """
@@ -231,19 +261,32 @@ async def chat(req: ChatRequest):
     conv_id = req.conv_id or str(uuid.uuid4())
 
     # 1. 读取记忆上下文
-    mem_ctx = await _memory.get_context(req.user_id, conv_id, query=req.message)
+    mem_ctx = await _memory.get_memory_context(req.user_id, conv_id, query=req.message)
 
     # 2. 构建编排请求（含对话历史，用于意图识别上下文）
     history = [
-        {"role": m.role.value, "content": m.content}
-        for m in mem_ctx.recent_messages[-5:]
-    ] if mem_ctx.recent_messages else None
+        {"role": m["role"], "content": m["content"]}
+        for m in mem_ctx["working_memory"][-5:]
+    ] if mem_ctx["working_memory"] else None
 
     knowledge_text, knowledge_used = await _build_knowledge_context(req.message)
-    context_parts = [mem_ctx.to_prompt_text()]
+    context_parts = []
+
+    if mem_ctx["history_summary"]:
+        context_parts.append("[相关历史对话]\n" + "\n".join(mem_ctx["history_summary"]))
+    if mem_ctx["user_profile"]:
+        context_parts.append("[用户画像信息]\n" + mem_ctx["user_profile"])
+    if mem_ctx["working_memory"]:
+        msg_lines = []
+        for m in mem_ctx["working_memory"]:
+            msg_lines.append(f"{m['role']}: {m['content']}")
+        context_parts.append("[当前对话]\n" + "\n".join(msg_lines))
+
     if knowledge_text:
         context_parts.append(knowledge_text)
-    full_context = "\n\n".join(part for part in context_parts if part)
+
+    full_context = "\n\n".join(context_parts) if context_parts else ""
+ 
 
     orch_req = OrcReq(
         message=req.message,
@@ -257,11 +300,12 @@ async def chat(req: ChatRequest):
     result = await _orchestrator.run(orch_req)
 
     # 4. 写入记忆
-    await _memory.add_message(req.user_id, conv_id, MsgRole.USER, req.message)
-    await _memory.add_message(req.user_id, conv_id, MsgRole.ASSISTANT, result.response)
+    await _memory.append_working_memory(req.user_id, conv_id, MsgRole.USER, req.message)
+    await _memory.append_working_memory(req.user_id, conv_id, MsgRole.ASSISTANT, result.response)
 
     # 5. 异步更新用户画像（不阻塞响应）
-    asyncio.create_task(_memory.update_profile(req.user_id, conv_id))
+    profile_candidate = f"最近用户提问：{req.message}，助手回复：{result.response}"
+    asyncio.create_task(_memory.update_user_profile(req.user_id, profile_candidate))
 
     return ChatResponse(
         conv_id=conv_id,
@@ -406,7 +450,7 @@ async def add_knowledge(body: BatchDocInput):
     if tool is None:
         raise HTTPException(503, "知识库未初始化")
     kb = tool.handler.__self__
-    count = kb.add_documents([{"title": d.title, "content": d.content} for d in body.documents])
+    count = await kb.add_documents([{"title": d.title, "content": d.content} for d in body.documents])
     return {"message": f"成功导入 {count} 个文档片段", "added_chunks": count, "total_chunks": kb.doc_count}
 
 
@@ -446,7 +490,7 @@ async def upload_knowledge(file: UploadFile = File(...)):
         title = filename.rsplit(".", 1)[0] if "." in filename else filename
         docs = [{"title": title, "content": text}]
 
-    count = kb.add_documents(docs)
+    count = await kb.add_documents(docs)
     return {
         "message": f"文件 {filename} 导入成功",
         "added_chunks": count,
@@ -522,9 +566,20 @@ async def _cli():
 
     from agents.agent_orchestrator import AgentOrchestrator, Request
     from memory.conversation_memory import MemoryManager, MsgRole
+    from core.skill_loader import SkillManager
 
     cfg = _anthropic_cfg()
-    orch = AgentOrchestrator(api_key=cfg["api_key"], base_url=cfg.get("base_url"), model=cfg["model"])
+    skill_manager = SkillManager(
+        root_dir=os.getenv("ECHOMIND_SKILLS_DIR", str(pathlib.Path(_ROOT) / "skills")),
+        max_prompt_chars=int(os.getenv("ECHOMIND_SKILLS_MAX_PROMPT_CHARS", "5000")),
+    )
+    skill_manager.load()
+    orch = AgentOrchestrator(
+        api_key=cfg["api_key"],
+        base_url=cfg.get("base_url"),
+        model=cfg["model"],
+        skill_manager=skill_manager,
+    )
     mem  = MemoryManager(
         redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0"),
         chroma_host=os.getenv("CHROMA_HOST", "localhost"),
@@ -547,16 +602,27 @@ async def _cli():
             print("再见 ʕ•ᴥ•ʔ")
             break
 
-        ctx = await mem.get_context(user_id, conv_id, query=msg)
+        mem_ctx = await mem.get_memory_context(user_id, conv_id, query=msg)
         history = [
-            {"role": m.role.value, "content": m.content}
-            for m in ctx.recent_messages[-5:]
-        ] if ctx.recent_messages else None
-        req = Request(message=msg, user_id=user_id, conv_id=conv_id, context=ctx.to_prompt_text(), history=history)
+            {"role": m["role"], "content": m["content"]}
+            for m in mem_ctx["working_memory"][-5:]
+        ] if mem_ctx["working_memory"] else None
+
+        context_parts = []
+        if mem_ctx["history_summary"]:
+            context_parts.append("[相关历史对话]\n" + "\n".join(mem_ctx["history_summary"]))
+        if mem_ctx["user_profile"]:
+            context_parts.append("[用户画像信息]\n" + mem_ctx["user_profile"])
+        if mem_ctx["working_memory"]:
+            msg_lines = [f"{m['role']}: {m['content']}" for m in mem_ctx["working_memory"]]
+            context_parts.append("[当前对话]\n" + "\n".join(msg_lines))
+        full_context = "\n\n".join(context_parts) if context_parts else ""
+
+        req = Request(message=msg, user_id=user_id, conv_id=conv_id, context=full_context, history=history)
         result = await orch.run(req)
 
-        await mem.add_message(user_id, conv_id, MsgRole.USER, msg)
-        await mem.add_message(user_id, conv_id, MsgRole.ASSISTANT, result.response)
+        await mem.append_working_memory(user_id, conv_id, MsgRole.USER, msg)
+        await mem.append_working_memory(user_id, conv_id, MsgRole.ASSISTANT, result.response)
 
         print(f"\nEchoMind [{result.agent_type.value}]: {result.response}\n")
 
@@ -571,3 +637,9 @@ if __name__ == "__main__":
             port=int(os.getenv("API_PORT", "8000")),
             reload=os.getenv("APP_ENV") == "development",
         )
+
+
+
+
+
+
