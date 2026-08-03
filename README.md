@@ -1,7 +1,20 @@
 # EchoMind
 
 > 面向企业服务场景的多 Agent 智能客服后端，融合意图识别、业务技能、RAG 知识库、长期记忆、监控评测与 Docker 化部署。
+## 项目结构
 
+```EchoMind-project/ ├── frontend/ # 前端项目 ├── README.md └── ... # 后端相关文件
+
+## 前端启动
+本项目包含后端服务和前端页面。前端代码位于 `frontend/` 目录中。
+进入前端目录：cd frontend
+```bash
+安装依赖：npm install
+```bash
+启动开发服务器：npm run dev
+```bash
+启动后，浏览器访问终端中显示的本地地址，通常是：http://localhost:5173/
+```text
 ---
 
 ## 项目简介
