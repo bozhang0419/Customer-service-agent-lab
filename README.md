@@ -1,6 +1,8 @@
-# EchoMind
+# customer-service-agent-lab
 
-> 面向企业服务场景的多 Agent 智能客服后端，融合意图识别、业务技能、RAG 知识库、长期记忆、监控评测与 Docker 化部署。
+> 客服 Agent 实验场：面向企业服务场景的多 Agent 智能客服后端，融合意图识别、业务技能、RAG 知识库、长期记忆、监控评测与 Docker 化部署。
+
+> 仓库原名 EchoMind-project。真实向量改造（用本地 ONNX 真 embedding 替换哈希兜底、恢复三路融合）位于 `feat/real-embedding` 分支，`main` 保留改造前基线，便于对照。
 
 
 ## 项目简介
@@ -11,7 +13,7 @@ EchoMind 是一个以 FastAPI 为入口的智能客服系统，目标是让企�
 
 ### 项目结构
 
-EchoMind-project/ ├── frontend/ # 前端项目 ├── README.md └── ... # 后端相关文件
+customer-service-agent-lab/ ├── frontend/ # 前端项目 ├── README.md └── ... # 后端相关文件
 
 ### 运行项目
 本项目包含后端服务和前端页面。前端代码位于 `frontend/` 目录中。
@@ -107,6 +109,7 @@ EchoMind-project/ ├── frontend/ # 前端项目 ├── README.md └─�
 | Docker | 推荐 | 用于一键启动 Redis、ChromaDB、Prometheus、Nginx 与主应用 |
 | Redis | 7.x | 工作记忆与短期缓存 |
 | ChromaDB | 0.5.23 | 向量知识库、情景记忆与用户画像 |
+| ONNX Embedding 模型 | 已内置 | all-MiniLM-L6-v2（384 维），Chroma 内置、本地推理，无需外部向量接口 |
 | Anthropic 兼容 API | 必需 | 读取 `ANTHROPIC_API_KEY`、`ANTHROPIC_MODEL`、`ANTHROPIC_BASE_URL` |
 
 
@@ -117,6 +120,14 @@ cp .env.example.env .env
 # 编辑 .env，至少填写 ANTHROPIC_API_KEY，并按需设置 ANTHROPIC_MODEL / ANTHROPIC_BASE_URL
 docker compose up -d --build
 ```
+
+> **首次构建需要 ONNX 模型包**：镜像会把 `onnx.tar.gz`（all-MiniLM-L6-v2，约 83MB）解压到 Chroma 的模型缓存目录，供本地真实向量推理使用。该文件体积较大，未纳入版本库，请在构建前自行下载并放到仓库根目录：
+>
+> ```bash
+> curl -L -o onnx.tar.gz https://chroma-onnx-models.s3.amazonaws.com/all-MiniLM-L6-v2/onnx.tar.gz
+> ```
+>
+> 若网络无法直连 S3，也可从其他可用来源获取同名文件。降级开关 `EMBEDDING_BACKEND=hash` 可在缺少模型时退回哈希向量（检索与意图精度下降，仅供联调）。
 
 启动后常用地址：
 
@@ -390,7 +401,7 @@ flowchart TD
 ## 项目结构
 
 ```text
-EchoMind-project/
+customer-service-agent-lab/
 ├── api/
 │   └── main.py                 # FastAPI 入口、生命周期装配、HTTP 路由
 ├── agents/
