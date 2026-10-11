@@ -1,34 +1,14 @@
 """
 RAG 知识库 —— 基于 ChromaDB 的真实检索实现。
-弃用Chroma内置all-MiniLM，统一调用DeepSeek线上向量接口
+向量统一走 core.embeddings（默认真实语义向量 all-MiniLM-L6-v2，384 维，纯本地）
 """
 import hashlib
 import logging
 from typing import Any, Dict, List, Optional
 
 import chromadb
-from core.embedding_client import EmbeddingClient
+from core.embeddings import embed_text, embed_texts, ensure_collection
 logger = logging.getLogger(__name__)
-
-def _local_embedding(text: str, dims: int = 256) -> list[float]:
-    """
-    本地字符n-gram哈希向量生成
-    与原项目意图识别模块的Embedding兜底逻辑完全一致
-    不调用任何外部接口，纯本地计算
-    """
-    normalized = text.lower().strip()
-    vec = [0.0] * dims
-    tokens = set()
-    # 1/2/3元字符哈希，固定输出256维向量
-    for n in (1, 2, 3):
-        if len(normalized) >= n:
-            tokens.update(normalized[i:i+n] for i in range(len(normalized) - n + 1))
-    for token in tokens:
-        digest = hashlib.md5(token.encode("utf-8")).digest()
-        idx = int.from_bytes(digest[:4], "big") % dims
-        sign = 1.0 if digest[4] % 2 == 0 else -1.0
-        vec[idx] += sign
-    return vec
 
 class KnowledgeBase:
     COLLECTION_NAME = "knowledge_base"
@@ -46,11 +26,7 @@ class KnowledgeBase:
         )
         logger.info(f"知识库【本地文件模式】启动，数据存放路径: {chroma_path}")
 
-        self._collection = self._client.get_or_create_collection(
-            name=self.COLLECTION_NAME,
-            metadata={"description": "EchoMind RAG 知识库"},
-        )
-        self.emb_client = EmbeddingClient()
+        self._collection = ensure_collection(self._client, self.COLLECTION_NAME, "EchoMind RAG 知识库")
 
     async def add_documents(self, documents: List[Dict[str, str]]) -> int:
         ids, docs, metas = [], [], []
@@ -67,7 +43,7 @@ class KnowledgeBase:
                 metas.append({"title": title, "chunk_index": i, "total_chunks": len(chunks)})
 
         if ids:
-            embeddings = [_local_embedding(doc) for doc in docs]
+            embeddings = embed_texts(docs)
             self._collection.add(
                 ids=ids,
                 embeddings=embeddings,
@@ -79,7 +55,7 @@ class KnowledgeBase:
         return len(ids)
 
     async def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        emb = _local_embedding(query)
+        emb = embed_text(query)
         results = self._collection.query(
             query_embeddings=[emb],
             n_results=top_k,

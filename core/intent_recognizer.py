@@ -10,15 +10,17 @@
 LLM 和 Embedding 并行调用，不串行等待。
 """
 import asyncio
-import hashlib
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from anthropic import AsyncAnthropic
+
+from core.embeddings import embed_text, embed_texts
 
 logger = logging.getLogger(__name__)
 
@@ -103,10 +105,14 @@ class IntentRecognizer:
         self.client    = AsyncAnthropic(**kwargs)
         self.model     = model
         self.threshold = confidence_threshold
-        # 第三方兼容 API（如 DeepSeek）通常不支持 Embedding，禁用该策略。
-        # 官方 Anthropic SDK 当前没有 embeddings 资源，因此下面会使用稳定的
-        # 本地字符 n-gram 向量作为轻量兜底，保证三路融合链路真实可跑。
-        self._embedding_enabled = not bool(base_url)
+        # 向量分支不再依赖远端 embeddings：core.embeddings 提供本地 all-MiniLM（无需任何 API，
+        # 离线可用），所以"第三方兼容 API 不支持 Embedding"这个禁用理由已不成立。
+        # 旧逻辑 `not bool(base_url)` 把"用了第三方兼容端点"误当成"没有 Embedding 服务"，
+        # 导致所有配置了 base_url 的部署（含本项目默认的 DeepSeek 配置）静默退化为两路，
+        # 权重表也跟着换成 [(llm,0.85),(pat,0.15)]——对外宣称的"三路融合"并未生效。
+        # 现改为默认启用；INTENT_EMBEDDING_BRANCH=off 可关闭，用于消融对比。
+        self._embedding_enabled = os.getenv("INTENT_EMBEDDING_BRANCH", "on").strip().lower() \
+            not in ("0", "off", "false", "no")
 
         self._tpl_embeddings: Dict[IntentCategory, List[List[float]]] = {}
         self._cache: Dict[str, IntentResult] = {}
@@ -213,7 +219,7 @@ class IntentRecognizer:
             resp = await self.client.messages.create(
                 model=self.model,
                 max_tokens=256,
-                temperature=0.1,
+                temperature=0.0,  # 分类任务：温度 0 让同一输入可复现，否则 A/B 对比会被采样噪声淹没
                 messages=[{"role": "user", "content": prompt}],
             )
             raw = resp.content[0].text
@@ -314,13 +320,13 @@ class IntentRecognizer:
     # ── 辅助 ──────────────────────────────────────────────────────────────────
 
     async def _load_template_embeddings(self) -> None:
-        """懒加载所有模板的 Embedding（只在首次调用时执行）。"""
+        """懒加载所有模板的 Embedding（只在首次调用时执行）。批量一次推理，避免逐条开销。"""
         missing = [cat for cat in _TEMPLATES if cat not in self._tpl_embeddings]
         if not missing:
             return
 
         all_texts = [t for cat in missing for t in _TEMPLATES[cat]]
-        vecs = [await self._embed_text(text) for text in all_texts]
+        vecs = await asyncio.to_thread(embed_texts, all_texts)
         idx = 0
         for cat in missing:
             n = len(_TEMPLATES[cat])
@@ -328,41 +334,11 @@ class IntentRecognizer:
             idx += n
 
     async def _embed_text(self, text: str) -> List[float]:
+        """生成文本向量：Chroma 内置 all-MiniLM-L6-v2（384 维，纯本地推理）。
+
+        放线程池执行，避免 ONNX 推理阻塞事件循环。
         """
-        生成文本向量。
-
-        如果未来接入的官方/兼容客户端提供 embeddings.create，会优先使用远端向量；
-        当前 Anthropic SDK 没有该资源时，退化为字符 n-gram 哈希向量。这样不会因为
-        Embedding 服务缺失导致三路融合中断。
-        """
-        embeddings = getattr(self.client, "embeddings", None)
-        if embeddings is not None:
-            try:
-                resp = await embeddings.create(model="voyage-3-lite", input=[text])
-                return list(resp.data[0].embedding)
-            except Exception as ex:
-                logger.warning(f"远端 Embedding 失败，使用本地向量兜底: {ex}")
-
-        return self._local_embedding(text)
-
-    @staticmethod
-    def _local_embedding(text: str, dims: int = 256) -> List[float]:
-        """稳定的字符 n-gram 哈希向量，用于无远端 Embedding 时的语义近似匹配。"""
-        normalized = text.lower().strip()
-        vec = [0.0] * dims
-        tokens = set()
-        for n in (1, 2, 3):
-            if len(normalized) >= n:
-                tokens.update(normalized[i:i + n] for i in range(len(normalized) - n + 1))
-        if not tokens:
-            tokens.add(normalized)
-
-        for token in tokens:
-            digest = hashlib.md5(token.encode("utf-8")).digest()
-            idx = int.from_bytes(digest[:4], "big") % dims
-            sign = 1.0 if digest[4] % 2 == 0 else -1.0
-            vec[idx] += sign
-        return vec
+        return await asyncio.to_thread(embed_text, text)
 
     def _urgency(self, message: str, intent: IntentCategory) -> UrgencyLevel:
         msg = message.lower()

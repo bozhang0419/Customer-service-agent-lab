@@ -24,11 +24,10 @@ COPY requirements.txt .
 RUN pip install --upgrade pip && \
     pip install -r requirements.txt
 
-# 预下载 ChromaDB 内置的 ONNX embedding 模型（~79MB），避免运行时下载超时
-RUN mkdir -p /root/.cache/chroma/onnx_models/all-MiniLM-L6-v2 && \
-    curl -L --retry 3 --retry-delay 5 -o /root/.cache/chroma/onnx_models/all-MiniLM-L6-v2/onnx.tar.gz \
-    https://chroma-onnx-models.s3.amazonaws.com/all-MiniLM-L6-v2/onnx.tar.gz && \
-    cd /root/.cache/chroma/onnx_models/all-MiniLM-L6-v2 && \
+# 预置 ChromaDB 内置的 ONNX embedding 模型（~79MB）
+# 原版从 S3 直连下载，国内网络会卡在 19% 不动；改为使用本地已下载好的 onnx.tar.gz
+COPY onnx.tar.gz /root/.cache/chroma/onnx_models/all-MiniLM-L6-v2/onnx.tar.gz
+RUN cd /root/.cache/chroma/onnx_models/all-MiniLM-L6-v2 && \
     tar -xzf onnx.tar.gz && \
     rm onnx.tar.gz
 

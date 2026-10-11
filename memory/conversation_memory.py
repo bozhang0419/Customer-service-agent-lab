@@ -1,6 +1,6 @@
 """
 三级记忆模块：Redis短时会话 + Chroma情景摘要 + 用户画像
-使用DeepSeek外部向量，不下载境外模型
+向量统一走 core.embeddings（默认真实语义向量 all-MiniLM-L6-v2，纯本地）
 """
 import json
 import logging
@@ -9,24 +9,10 @@ from enum import Enum
 from typing import List, Dict, Optional
 import redis.asyncio as redis
 import chromadb
-from core.embedding_client import EmbeddingClient
+from core.embeddings import embed_text, ensure_collection
 
 logger = logging.getLogger(__name__)
-def _local_embedding(text: str, dims: int = 256) -> list[float]:
-    """本地n-gram哈希向量，不调用任何远程Embedding接口，与知识库逻辑统一"""
-    normalized = text.lower().strip()
-    vec = [0.0] * dims
-    tokens = set()
-    # 1/2/3字符分词哈希
-    for n in (1, 2, 3):
-        if len(normalized) >= n:
-            tokens.update(normalized[i:i+n] for i in range(len(normalized) - n + 1))
-    for token in tokens:
-        digest = hashlib.md5(token.encode("utf-8")).digest()
-        idx = int.from_bytes(digest[:4], "big") % dims
-        sign = 1.0 if digest[4] % 2 == 0 else -1.0
-        vec[idx] += sign
-    return vec
+
 
 class MsgRole(str, Enum):
     USER = "user"
@@ -51,7 +37,6 @@ class MemoryManager:
         model=None
     ):
         self.redis = redis.from_url(redis_url)
-        self.emb_client = EmbeddingClient()
 
         self._chroma_client = None
         self._episodic = None
@@ -65,8 +50,8 @@ class MemoryManager:
         except Exception:
             self._chroma_client = chromadb.PersistentClient(path=path, settings=chromadb.Settings(anonymized_telemetry=False))
 
-        self._episodic = self._chroma_client.get_or_create_collection(name="episodic", metadata={"desc":"会话摘要记忆"})
-        self._profile = self._chroma_client.get_or_create_collection(name="user_profile", metadata={"desc":"用户画像"})
+        self._episodic = ensure_collection(self._chroma_client, "episodic", "会话摘要记忆")
+        self._profile = ensure_collection(self._chroma_client, "user_profile", "用户画像")
 
     def _safe_text(self, s: str) -> str:
         if not s:
@@ -122,7 +107,7 @@ class MemoryManager:
         if not text:
             return
         doc_id = hashlib.md5(f"{user_id}_{conv_id}_{text[:100]}".encode()).hexdigest()
-        emb = _local_embedding(text)
+        emb = embed_text(text)
         meta = {
             "user_id": user_id,
             "conv_id": conv_id,
@@ -140,7 +125,7 @@ class MemoryManager:
         if not query_text:
             return []
         try:
-            emb = _local_embedding(query_text)
+            emb = embed_text(query_text)
             results = self._episodic.query(
                 query_embeddings=[emb],
                 n_results=self.HISTORY_TOP_K,
@@ -157,7 +142,7 @@ class MemoryManager:
         if not text:
             return
         doc_id = hashlib.md5(f"profile_{user_id}".encode()).hexdigest()
-        emb = _local_embedding(text)
+        emb = embed_text(text)
         meta = {"user_id": user_id}
         try:
             # upsert：doc_id 固定为 profile_{user_id}，覆盖写入即达到“更新画像”语义，

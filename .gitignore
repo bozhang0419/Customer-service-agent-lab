@@ -37,3 +37,6 @@ docker-compose(1).yml
 
 # 本地reasonix缓存目录
 .reasonix/
+
+# ONNX embedding 模型包（83MB，仅本地构建使用，不入库）
+onnx.tar.gz
